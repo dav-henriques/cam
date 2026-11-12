@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<!--
+  Base: widget flutuante de liquid glass, arrastável e recolhível.
+
+  Stack (via CDN): liquidGL 3.0.0 (vidro), GSAP 3.15.1 + Draggable + InertiaPlugin (arrasto), anime.js 4.5.0 (animações).
+
+  Regras para manter o vidro funcionando:
+  - Conteúdo do widget vai dentro de .body (dentro de .panel-inner). Não aplicar transform no .panel, a liquidGL controla o transform dele.
+  - O .panel precisa continuar position: fixed e com o z-index mais alto da página. Tudo atrás dele é refratado.
+  - A liquidGL tira uma "foto" estática da página. Conteúdo animado atrás do vidro só aparece em movimento se for <video>
+    (ex.: desenhar num canvas e exibir via canvas.captureStream() num <video>). Elementos com data-liquid-ignore ficam fora da foto.
+  - Propriedades do vidro podem ser animadas em tempo real pelo objeto "glass" no script (valores de repouso em BASE).
+  - specular fica desligado: na liquidGL ele força redesenho a cada quadro. O brilho do vidro é CSS (.panel-inner::before).
+  - O fundo da página é a câmera do dispositivo (<video id="cam">). O vídeo é dimensionado por JS no modo "cover"
+    em vez de object-fit, porque a liquidGL desenha o vídeo esticado no retângulo do elemento.
+    Não espelhar o vídeo com CSS transform: a liquidGL ignora o transform e o vidro mostraria a imagem invertida.
+  - Câmera exige HTTPS ou localhost. No celular, http://IP-do-PC não libera a câmera; usar um túnel HTTPS ou hospedar.
+  - Evitar template literals (crases); o código usa concatenação com + para não quebrar ao copiar.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
+<title>widget</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --fg: #141414;
+    --dim: rgba(20, 20, 20, 0.5);
+    --faint: rgba(20, 20, 20, 0.14);
+    --sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+    --mono: "Geist Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    overscroll-behavior: none;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 12px/1.4 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    position: fixed;
+    inset: 0;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  .probe {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: env(safe-area-inset-bottom, 0px);
+    padding-top: env(safe-area-inset-top, 0px);
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  .page {
+    position: relative;
+    height: 100vh;
+    height: 100svh;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+
+  .page video {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: fill;
+    background: var(--bg);
+    pointer-events: none;
+  }
+
+  .notice {
+    position: relative;
+    max-width: 280px;
+    margin: 0;
+    padding: 24px;
+    font: 400 13px/1.5 var(--sans);
+    color: rgba(255, 255, 255, 0.55);
+    text-align: center;
+  }
+
+  .notice[hidden] { display: none; }
+
+  .panel {
+    position: fixed;
+    left: 24px;
+    top: 24px;
+    width: 264px;
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.45);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    z-index: 10;
+  }
+
+  .panel-inner {
+    position: relative;
+    z-index: 3;
+    pointer-events: auto;
+    border-radius: inherit;
+    box-shadow:
+      inset 0 1px 0.5px rgba(255, 255, 255, 0.95),
+      inset 0 -1px 0.5px rgba(255, 255, 255, 0.4),
+      inset 0 0 0 0.5px rgba(255, 255, 255, 0.55),
+      0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  }
+
+  .panel-inner::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background:
+      radial-gradient(120% 60% at 15% 0%, rgba(255, 255, 255, 0.55) 0%, rgba(255, 255, 255, 0) 55%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0) 70%, rgba(255, 255, 255, 0.25) 100%);
+    opacity: var(--sheen, 0.8);
+    pointer-events: none;
+  }
+
+  .handle {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px 12px 18px;
+    cursor: grab;
+    user-select: none;
+    touch-action: none;
+  }
+
+  .handle.grabbing { cursor: grabbing; }
+
+  .grip {
+    display: grid;
+    grid-template-columns: repeat(3, 3px);
+    gap: 3px;
+  }
+
+  .grip i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--dim);
+  }
+
+  .title {
+    flex: 1;
+    font-weight: 500;
+    font-size: 12px;
+    letter-spacing: 0.01em;
+    color: var(--dim);
+  }
+
+  button {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--dim);
+    cursor: pointer;
+    transition: color .2s;
+  }
+
+  button:hover, button:focus-visible { color: var(--fg); outline: none; }
+
+  .collapse {
+    position: relative;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+  }
+
+  .collapse span {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 9px;
+    height: 1.5px;
+    margin: -0.75px 0 0 -4.5px;
+    border-radius: 1px;
+    background: currentColor;
+  }
+
+  .collapse span + span { transform: rotate(90deg) scaleX(0); }
+
+  .wrap { overflow: hidden; }
+
+  .body {
+    min-height: 140px;
+    padding: 2px 18px 18px;
+  }
+
+  @media (max-width: 480px) {
+    .panel { width: 248px; }
+    .body { padding: 2px 16px 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="probe" id="probe" data-liquid-ignore></div>
+
+<main class="page">
+  <video id="cam" muted playsinline autoplay></video>
+  <p class="notice" id="notice">abrindo a câmera…</p>
+</main>
+
+<div class="panel" id="panel">
+  <div class="panel-inner" id="inner">
+    <div class="handle" id="handle">
+      <div class="grip" id="grip"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="title">widget</div>
+      <button class="collapse" id="collapse" aria-label="recolher"><span></span><span></span></button>
+    </div>
+    <div class="wrap" id="wrap">
+      <div class="body" id="body"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.1/dist/gsap.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.1/dist/Draggable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.1/dist/InertiaPlugin.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/animejs@4.5.0/dist/bundles/anime.umd.min.js"></script>
+
+<script type="module">
+  import liquidGL from "https://cdn.jsdelivr.net/npm/liquid-gl@3.0.0/liquidGL.js";
+
+  gsap.registerPlugin(Draggable, InertiaPlugin);
+
+  var animate = anime.animate;
+  var stagger = anime.stagger;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var panel = $('panel');
+  var inner = $('inner');
+  var handle = $('handle');
+  var grip = $('grip');
+  var collapse = $('collapse');
+  var wrap = $('wrap');
+  var body = $('body');
+  var probe = $('probe');
+
+  var isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  var lens = null;
+  var BASE = { refraction: 0.015, bevelDepth: 0.16, magnify: 1 };
+  var glass = { refraction: BASE.refraction, bevelDepth: BASE.bevelDepth, magnify: BASE.magnify, sheen: 0.8 };
+  var applied = {};
+
+  gsap.ticker.add(function () {
+    if (applied.sheen !== glass.sheen) {
+      applied.sheen = glass.sheen;
+      inner.style.setProperty('--sheen', glass.sheen.toFixed(3));
+    }
+    if (!lens) return;
+    ['refraction', 'bevelDepth', 'magnify'].forEach(function (k) {
+      if (applied[k] !== glass[k]) {
+        applied[k] = glass[k];
+        lens.options[k] = glass[k];
+      }
+    });
+  });
+
+  function wobble(strength) {
+    gsap.timeline()
+      .to(glass, { magnify: 1 + 0.04 * strength, bevelDepth: BASE.bevelDepth + 0.06 * strength, duration: 0.18, ease: 'power2.out' })
+      .to(glass, { magnify: BASE.magnify, bevelDepth: BASE.bevelDepth, duration: 1.1, ease: 'elastic.out(1, 0.4)' });
+  }
+
+  function safe() {
+    var cs = getComputedStyle(probe);
+    return { top: parseFloat(cs.paddingTop) || 0, bottom: parseFloat(cs.height) || 0 };
+  }
+
+  function bounds() {
+    var r = panel.getBoundingClientRect();
+    var sa = safe();
+    var m = window.innerWidth < 480 ? 12 : 10;
+    return {
+      minX: m, maxX: Math.max(m, window.innerWidth - r.width - m),
+      minY: m + sa.top, maxY: Math.max(m + sa.top, window.innerHeight - r.height - m - sa.bottom)
+    };
+  }
+
+  var followX = gsap.quickTo(panel, 'left', { duration: 0.2, ease: 'power2.out' });
+  var followY = gsap.quickTo(panel, 'top', { duration: 0.2, ease: 'power2.out' });
+
+  function keepInside() {
+    var r = panel.getBoundingClientRect();
+    var b = bounds();
+    followX(Math.min(Math.max(b.minX, r.left), b.maxX));
+    followY(Math.min(Math.max(b.minY, r.top), b.maxY));
+  }
+
+  var proxy = document.createElement('div');
+  proxy.setAttribute('data-liquid-ignore', '');
+  proxy.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none';
+  document.body.appendChild(proxy);
+
+  Draggable.create(proxy, {
+    type: 'x,y',
+    trigger: handle,
+    dragClickables: false,
+    inertia: true,
+    edgeResistance: 0.8,
+    throwResistance: 2200,
+    bounds: bounds(),
+    onPress: function () {
+      var r = panel.getBoundingClientRect();
+      gsap.set(proxy, { x: r.left, y: r.top });
+      this.applyBounds(bounds());
+      this.update();
+      handle.classList.add('grabbing');
+      gsap.to(glass, { magnify: 1.04, bevelDepth: 0.22, refraction: 0.025, sheen: 1, duration: 0.3, ease: 'power3.out' });
+      animate(grip.children, {
+        scale: [{ to: 1.5, duration: 140 }, { to: 1, duration: 420 }],
+        delay: stagger(22, { grid: [3, 2], from: 'center' }),
+        ease: 'outQuad'
+      });
+    },
+    onDrag: function () { followX(this.x); followY(this.y); },
+    onThrowUpdate: function () { followX(this.x); followY(this.y); },
+    onRelease: function () {
+      handle.classList.remove('grabbing');
+      gsap.to(glass, { magnify: BASE.magnify, bevelDepth: BASE.bevelDepth, refraction: BASE.refraction, sheen: 0.8, duration: 1.2, ease: 'elastic.out(1, 0.4)' });
+    }
+  });
+
+  var closed = false;
+  var bars = collapse.querySelectorAll('span');
+
+  collapse.addEventListener('click', function () {
+    closed = !closed;
+    collapse.setAttribute('aria-label', closed ? 'expandir' : 'recolher');
+    animate(bars[1], { scaleX: closed ? 1 : 0, rotate: 90, duration: 500, ease: 'outBack(2)' });
+    animate(bars[0], { rotate: closed ? [0, 180] : [180, 0], duration: 500, ease: 'outExpo' });
+    wobble(0.7);
+
+    if (closed) {
+      animate(body, { opacity: 0, translateY: -6, duration: 220, ease: 'inQuad' });
+      gsap.to(wrap, { height: 0, duration: 0.55, delay: 0.08, ease: 'power3.inOut' });
+    } else {
+      gsap.fromTo(wrap, { height: 0 }, { height: 'auto', duration: 0.6, ease: 'power3.out', onComplete: keepInside });
+      animate(body, { opacity: [0, 1], translateY: [10, 0], duration: 700, delay: 120, ease: 'outExpo' });
+    }
+  });
+
+  inner.addEventListener('mouseenter', function () {
+    gsap.to(glass, { sheen: 1, duration: 0.5, ease: 'power2.out' });
+  });
+  inner.addEventListener('mouseleave', function () {
+    gsap.to(glass, { sheen: 0.8, duration: 0.7, ease: 'power2.out' });
+  });
+
+  var resizeTimer = null;
+  function onResize() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(keepInside, 120);
+  }
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+
+  var startMargin = window.innerWidth < 480 ? 12 : 24;
+  gsap.set(panel, {
+    left: window.innerWidth < 480 ? (window.innerWidth - panel.offsetWidth) / 2 : startMargin,
+    top: window.innerHeight - panel.offsetHeight - startMargin - safe().bottom
+  });
+
+  animate('.handle > *, .body', {
+    opacity: [0, 1],
+    translateY: [8, 0],
+    duration: 800,
+    delay: stagger(60, { start: 300 }),
+    ease: 'outExpo'
+  });
+
+  var cam = $('cam');
+  var notice = $('notice');
+  var stream = null;
+
+  function layoutCam() {
+    var vw = cam.videoWidth, vh = cam.videoHeight;
+    if (!vw || !vh) return;
+    var W = window.innerWidth, H = window.innerHeight;
+    var k = Math.max(W / vw, H / vh);
+    var w = Math.ceil(vw * k), h = Math.ceil(vh * k);
+    cam.style.width = w + 'px';
+    cam.style.height = h + 'px';
+    cam.style.left = Math.round((W - w) / 2) + 'px';
+    cam.style.top = Math.round((H - h) / 2) + 'px';
+  }
+
+  function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      notice.textContent = window.isSecureContext
+        ? 'este navegador não dá acesso à câmera.'
+        : 'a câmera só funciona em https ou localhost.';
+      return Promise.resolve(false);
+    }
+    return navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 }
+      }
+    }).then(function (s) {
+      stream = s;
+      cam.srcObject = s;
+      return new Promise(function (resolve) {
+        var done = function () {
+          layoutCam();
+          notice.hidden = true;
+          resolve(true);
+        };
+        if (cam.readyState >= 2) done();
+        else cam.addEventListener('loadeddata', done, { once: true });
+        cam.play().catch(function () {});
+      });
+    }).catch(function (err) {
+      notice.textContent = err && err.name === 'NotAllowedError'
+        ? 'acesso à câmera negado. libere nas permissões do navegador e recarregue.'
+        : 'não foi possível abrir a câmera.';
+      return false;
+    });
+  }
+
+  cam.addEventListener('resize', layoutCam);
+  window.addEventListener('resize', function () { requestAnimationFrame(layoutCam); });
+  window.addEventListener('pointerdown', function () {
+    if (stream && cam.paused) cam.play().catch(function () {});
+  }, { passive: true });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && stream && cam.paused) cam.play().catch(function () {});
+  });
+  window.addEventListener('pagehide', function () {
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+  });
+
+  var loaded = new Promise(function (resolve) {
+    if (document.readyState === 'complete') resolve();
+    else window.addEventListener('load', resolve, { once: true });
+  });
+
+  Promise.all([loaded, startCamera()]).then(function () {
+    try {
+      lens = liquidGL({
+        target: '.panel',
+        snapshot: 'body',
+        resolution: 1,
+        engine: isIOS ? 'webgl2' : 'auto',
+        refraction: BASE.refraction,
+        bevelDepth: BASE.bevelDepth,
+        bevelWidth: 0.24,
+        frost: 0,
+        aberration: 0.06,
+        tint: 'rgba(255, 255, 255, 0.22)',
+        specular: false,
+        shadow: true,
+        reveal: 'fade',
+        on: {
+          init: function () {
+            liquidGL.syncWith({ gsap: gsap });
+            glass.refraction = 0.1;
+            glass.magnify = 1.1;
+            gsap.to(glass, { refraction: BASE.refraction, magnify: BASE.magnify, duration: 1.6, ease: 'elastic.out(1, 0.45)' });
+          }
+        }
+      });
+      if (Array.isArray(lens)) lens = lens[0];
+    } catch (err) {
+      console.warn('liquidGL não iniciou:', err);
+    }
+  });
+</script>
+</body>
+</html>
